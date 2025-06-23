@@ -1,0 +1,362 @@
+---
+title: "PyTorch Training Locally in R (Epigenetic Clock)"
+format: 
+  html:
+    theme: minty
+    toc: true
+    toc-expand: 3
+    toc-location: left
+    embed-resources: true
+editor: visual
+execute:
+  warning: FALSE
+---
+
+### tl;dr
+
+This script trains a Torch model for age prediction using DNA methylation data in R.
+
+It includes data loading, preprocessing, model training, evaluation, and visualization.
+
+The pipeline is structured to be reproducible and modular, allowing for easy adjustments to hyperparameters and probe sets on the VAI HPC with GPU settings.
+
+```{r}
+# Load Libraries
+library(torch)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(arrow)
+library(rsample)
+library(yardstick)
+library(ggplot2)
+library(patchwork)
+library(reticulate)
+
+# --- Configuration ---
+# Set a project directory
+project_dir <- "/varidata/research/projects/laird/jaemin.park/HPC/deepRclock"
+knitr::opts_knit$set(root.dir = project_dir)
+
+# Set seed for reproducibility
+seed <- 42
+set.seed(seed)
+torch::cuda_is_available()
+torch_manual_seed(seed)
+
+# --- Device and Hyperparameter Configuration ---
+device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
+cat(paste("Using device:", device$type, "\n"))
+
+# Training Hyperparameters
+num_epochs     <- 100
+batch_size     <- 128
+learning_rate  <- 1e-4
+weight_decay   <- 1e-5
+patience       <- 15      # For early stopping
+dropout_rate   <- 0.4
+split_ratios   <- list(train = 0.70, val = 0.15, test = 0.15)
+num_workers    <- 0       # Dataloader workers
+
+# --- Data Paths ---
+beta_matrix_path <- file.path(project_dir, "beta_matrix_dense.npy")
+probe_ids_path   <- file.path(project_dir, "cpgprobes_from_mtx.npy")
+sample_ids_path  <- file.path(project_dir, "gsmid_mtx_from_mtx.npy")
+metadata_path    <- file.path(project_dir, "meta_filtered.feather")
+probe_list_dir   <- file.path(project_dir, "scripts/probe_lists")
+
+# --- Experiment Definition ---
+# Define different sets of CpG probes to train models on
+probe_sets_to_run <- list(
+  "all_probes"     = NULL,
+  "polycomb_CGI"   = file.path(probe_list_dir, "polycomb_CGI_probes.txt"),
+  "PMDsoloWCGW"    = file.path(probe_list_dir, "PMDsoloWCGW_probes.txt"),
+  "most_variable"  = file.path(probe_list_dir, "most_variable_probes.txt")
+)
+
+# Use reticulate to load Python's numpy arrays
+np <- reticulate::import("numpy", convert = FALSE)
+```
+
+### 2. model architecture
+
+```{r}
+# Define the MLP Model using nn_module
+age_predictor_mlp <- nn_module(
+  "AgePredictorMLP",
+  initialize = function(input_size,
+                        hidden1_size = 512,
+                        hidden2_size = 256,
+                        dropout_rate = 0.4) {
+    self$network <- nn_sequential(
+      # Layer 1
+      nn_linear(input_size, hidden1_size),
+      nn_batch_norm1d(hidden1_size),
+      nn_relu(),
+      nn_dropout(dropout_rate),
+      # Layer 2
+      nn_linear(hidden1_size, hidden2_size),
+      nn_batch_norm1d(hidden2_size),
+      nn_relu(),
+      nn_dropout(dropout_rate),
+      # Output Layer
+      nn_linear(hidden2_size, 1)
+    )
+  },
+  forward = function(x) {
+    self$network(x)
+  }
+)
+
+# Display an example model structure
+model_instance <- age_predictor_mlp(input_size = 10000)
+print(model_instance)
+```
+
+### 3. Main Training Loop
+
+```{r}
+results_summary <- list()
+
+# Iterate through each defined probe set
+for (probe_set_name in names(probe_sets_to_run)) {
+  
+  cat(paste0("\n--- Starting Experiment: ", probe_set_name, " ---\n"))
+  
+  # 1. DATA LOADING AND PREPROCESSING
+  cat("1. Loading and preprocessing data...\n")
+  X_full         <- py_to_r(np$load(beta_matrix_path))
+  all_probe_ids  <- as.character(py_to_r(np$load(probe_ids_path, allow_pickle=TRUE)))
+  all_sample_ids <- toupper(trimws(as.character(py_to_r(np$load(sample_ids_path, allow_pickle=TRUE)))))
+  meta_df        <- arrow::read_feather(metadata_path)
+  
+  # Align methylation data with metadata
+  X_full         <- t(X_full)
+  meta_dt        <- as.data.table(meta_df)[, .(gsm = toupper(trimws(as.character(gsm))), age_years)]
+  samples_dt     <- data.table(gsm = all_sample_ids, original_order = 1:length(all_sample_ids))
+  meta_aligned   <- meta_dt[samples_dt, on = "gsm", nomatch=0][order(original_order)]
+  
+  # Filter out samples with missing age
+  valid_indices  <- which(!is.na(meta_aligned$age_years))
+  X_full         <- X_full[valid_indices, , drop = FALSE]
+  ages           <- as.numeric(meta_aligned$age_years[valid_indices])
+  
+  # Filter probes based on the current experiment's list
+  probe_file_path <- probe_sets_to_run[[probe_set_name]]
+  if (!is.null(probe_file_path)) {
+    target_probes <- readLines(probe_file_path)
+    probe_mask    <- all_probe_ids %in% target_probes
+    X_filtered    <- X_full[, probe_mask, drop = FALSE]
+  } else {
+    X_filtered <- X_full
+  }
+  n_features <- ncol(X_filtered)
+  cat(paste("  Prepared data with", n_features, "features.\n"))
+
+  # 2. DATA SPLITTING & SCALING
+  cat("2. Splitting and scaling data...\n")
+  # Split data into training, validation, and test sets
+  split_obj      <- initial_split(data.frame(idx = 1:nrow(X_filtered)), prop = split_ratios$train)
+  train_indices  <- training(split_obj)$idx
+  temp_indices   <- testing(split_obj)$idx
+  val_test_split <- initial_split(data.frame(idx = temp_indices), prop = split_ratios$val / (split_ratios$val + split_ratios$test))
+  val_indices    <- training(val_test_split)$idx
+  test_indices   <- testing(val_test_split)$idx
+  
+  # Scale features based on the training set
+  train_means    <- colMeans(X_filtered[train_indices, ], na.rm = TRUE)
+  train_sds      <- apply(X_filtered[train_indices, ], 2, sd, na.rm = TRUE)
+  train_sds[is.na(train_sds) | train_sds == 0] <- 1 # Avoid division by zero
+  
+  X_train_scaled <- scale(X_filtered[train_indices, ], center = train_means, scale = train_sds)
+  X_val_scaled   <- scale(X_filtered[val_indices, ], center = train_means, scale = train_sds)
+  X_test_scaled  <- scale(X_filtered[test_indices, ], center = train_means, scale = train_sds)
+
+  y_train <- ages[train_indices]; y_val <- ages[val_indices]; y_test <- ages[test_indices]
+  
+  # 3. DATALOADER CREATION
+  cat("3. Creating PyTorch dataloaders...\n")
+  train_dataset <- tensor_dataset(
+    torch_tensor(X_train_scaled, dtype = torch_float32()),
+    torch_tensor(y_train, dtype = torch_float32())$unsqueeze(2)
+  )
+  val_dataset <- tensor_dataset(
+    torch_tensor(X_val_scaled, dtype = torch_float32()),
+    torch_tensor(y_val, dtype = torch_float32())$unsqueeze(2)
+  )
+  test_dataset <- tensor_dataset(
+    torch_tensor(X_test_scaled, dtype = torch_float32()),
+    torch_tensor(y_test, dtype = torch_float32())$unsqueeze(2)
+  )
+  
+  train_loader <- dataloader(train_dataset, batch_size = batch_size, shuffle = TRUE, num_workers = num_workers)
+  val_loader   <- dataloader(val_dataset, batch_size = batch_size, shuffle = FALSE, num_workers = num_workers)
+  test_loader  <- dataloader(test_dataset, batch_size = batch_size, shuffle = FALSE, num_workers = num_workers)
+
+  # 4. MODEL INITIALIZATION AND TRAINING
+  cat("4. Initializing and training the model...\n")
+  model <- age_predictor_mlp(input_size = n_features, dropout_rate = dropout_rate)$to(device = device)
+  optimizer <- optim_adamw(model$parameters, lr = learning_rate, weight_decay = weight_decay)
+  scheduler <- lr_reduce_on_plateau(optimizer, patience = 5, factor = 0.2)
+  
+  best_val_loss <- Inf
+  epochs_no_improve <- 0
+  history <- data.frame()
+
+  for (epoch in 1:num_epochs) {
+    # Training phase
+    model$train()
+    train_loss <- 0
+    coro::loop(for (b in train_loader) {
+      optimizer$zero_grad()
+      outputs <- model(b[[1]]$to(device = device))
+      loss <- nnf_smooth_l1_loss(outputs, b[[2]]$to(device = device))
+      loss$backward()
+      optimizer$step()
+      train_loss <- train_loss + loss$item()
+    })
+    
+    # Validation phase
+    model$eval()
+    val_loss <- 0
+    all_preds <- c(); all_labels <- c()
+    with_no_grad({
+      coro::loop(for (b in val_loader) {
+        outputs <- model(b[[1]]$to(device = device))
+        loss <- nnf_smooth_l1_loss(outputs, b[[2]]$to(device = device))
+        val_loss <- val_loss + loss$item()
+        all_preds <- c(all_preds, as.numeric(outputs$cpu()))
+        all_labels <- c(all_labels, as.numeric(b[[2]]$cpu()))
+      })
+    })
+    
+    # Log metrics and check for early stopping
+    epoch_val_loss <- val_loss / length(val_loader)
+    epoch_val_mae <- mae_vec(truth = all_labels, estimate = pmax(0, all_preds))
+    history <- rbind(history, data.frame(epoch, train_loss = train_loss/length(train_loader), val_loss = epoch_val_loss, val_mae = epoch_val_mae))
+    cat(sprintf("  Epoch %02d: Val Loss: %.4f, Val MAE: %.4f\n", epoch, epoch_val_loss, epoch_val_mae))
+    
+    scheduler$step(epoch_val_loss)
+    if (epoch_val_loss < best_val_loss) {
+      best_val_loss <- epoch_val_loss
+      torch_save(model$state_dict(), "best_model.pt")
+      epochs_no_improve <- 0
+    } else {
+      epochs_no_improve <- epochs_no_improve + 1
+    }
+    
+    if (epochs_no_improve >= patience) {
+      cat(paste("Early stopping at epoch", epoch, "\n"))
+      break
+    }
+  }
+
+  # 5. FINAL EVALUATION ON TEST SET
+  cat("5. Evaluating on the test set...\n")
+  # Load best model and evaluate
+  best_model <- age_predictor_mlp(input_size = n_features, dropout_rate = dropout_rate)
+  best_model$load_state_dict(torch_load("best_model.pt"))
+  best_model$to(device = device)$eval()
+  
+  test_preds <- c()
+  with_no_grad({
+    coro::loop(for (b in test_loader) {
+      outputs <- best_model(b[[1]]$to(device = device))
+      test_preds <- c(test_preds, as.numeric(outputs$cpu()))
+    })
+  })
+  test_preds_corr <- pmax(0, test_preds)
+  
+  final_mae <- mae_vec(truth = y_test, estimate = test_preds_corr)
+  final_rsq <- rsq_vec(truth = y_test, estimate = test_preds_corr)
+  final_ccc <- ccc_vec(truth = y_test, estimate = test_preds_corr)
+  
+  cat("  --- Test Set Performance ---\n")
+  cat(sprintf("  MAE: %.4f\n  R²:  %.4f\n  CCC: %.4f\n", final_mae, final_rsq, final_ccc))
+  
+  # Store results
+  results_summary[[probe_set_name]] <- list(
+    ProbeSet = probe_set_name,
+    Num_Features = n_features,
+    MAE = final_mae,
+    R2 = final_rsq,
+    CCC = final_ccc,
+    Epochs_Ran = epoch,
+    History = history,
+    Test_Predictions = data.frame(Actual = y_test, Predicted = test_preds_corr)
+  )
+}
+```
+
+### 4. Results & Visualization
+
+```{r}
+# Convert results list to a single data.table
+results_df <- rbindlist(lapply(results_summary, function(x) {
+  data.frame(ProbeSet=x$ProbeSet, Num_Features=x$Num_Features, MAE=x$MAE, R2=x$R2, CCC=x$CCC)
+}))
+
+# Print summary table
+cat("\n--- Final Performance Summary ---\n")
+print(results_df)
+
+# --- Visualize Performance Comparison ---
+
+# 1. MAE Bar Chart
+p1 <- ggplot(results_df, aes(x = reorder(ProbeSet, MAE), y = MAE, fill = ProbeSet)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.2f", MAE)), vjust = -0.5) +
+  labs(title = "Mean Absolute Error (MAE) by Probe Set", x = "Probe Set", y = "MAE (Years)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 2. R-squared Bar Chart
+p2 <- ggplot(results_df, aes(x = reorder(ProbeSet, -R2), y = R2, fill = ProbeSet)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.3f", R2)), vjust = -0.5) +
+  labs(title = "R-squared (R²) by Probe Set", x = "Probe Set", y = "R-squared") +
+  ylim(0, 1) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display combined plot
+print(p1 + p2)
+
+# --- Visualize a Specific Result (e.g., the best one) ---
+best_probe_set <- results_df$ProbeSet[which.min(results_df$MAE)]
+cat(paste("\n--- Visualizing Best Model:", best_probe_set, "---\n"))
+
+# 1. Training History Plot
+history_data <- results_summary[[best_probe_set]]$History
+p_hist <- ggplot(history_data, aes(x = epoch)) +
+  geom_line(aes(y = train_loss, color = "Train Loss")) +
+  geom_line(aes(y = val_loss, color = "Validation Loss")) +
+  labs(title = paste("Training History for", best_probe_set), x = "Epoch", y = "Loss", color = "") +
+  theme_minimal() + theme(legend.position="bottom")
+
+# 2. Actual vs. Predicted Plot
+pred_data <- results_summary[[best_probe_set]]$Test_Predictions
+mae_val <- results_summary[[best_probe_set]]$MAE
+r2_val <- results_summary[[best_probe_set]]$R2
+p_pred <- ggplot(pred_data, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  coord_fixed() +
+  labs(
+    title = paste("Actual vs. Predicted Age for", best_probe_set),
+    subtitle = sprintf("MAE = %.2f years, R² = %.3f", mae_val, r2_val),
+    x = "Actual Age (Years)", y = "Predicted Age (Years)"
+  ) +
+  theme_minimal()
+
+# Display plots for the best model
+print(p_hist)
+print(p_pred)
+```
+### sessionInfo
+
+```{r}
+sessionInfo()
+```
+
+

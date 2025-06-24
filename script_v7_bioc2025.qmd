@@ -1,5 +1,5 @@
 ---
-title: "PyTorch Training Locally in R (Epigenetic Clock)"
+title: "Torch epiclock Training in R"
 format: 
   html:
     theme: minty
@@ -20,6 +20,8 @@ It includes data loading, preprocessing, model training, evaluation, and visuali
 
 The pipeline is structured to be reproducible and modular, allowing for easy adjustments to hyperparameters and probe sets on the VAI HPC with GPU settings.
 
+### 1. setup
+
 ```{r}
 # Load Libraries
 library(torch)
@@ -35,7 +37,7 @@ library(reticulate)
 
 # --- Configuration ---
 # Set a project directory
-project_dir <- "/varidata/research/projects/laird/jaemin.park/HPC/deepRclock"
+project_dir <- "/varidata/research/projects/laird/jaemin.park/HPC/deeplearned-epiclock"
 knitr::opts_knit$set(root.dir = project_dir)
 
 # Set seed for reproducibility

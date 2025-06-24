@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 
-<title>PyTorch Training Locally in R (Epigenetic Clock)</title>
+<title>Torch epiclock Training in R</title>
 <style>
 code{white-space: pre-wrap;}
 span.smallcaps{font-variant: small-caps;}
@@ -3085,6 +3085,7 @@ vertical-align: -.125em;
    
   <ul>
   <li><a href="#tldr" id="toc-tldr" class="nav-link active" data-scroll-target="#tldr">tl;dr</a></li>
+  <li><a href="#setup" id="toc-setup" class="nav-link" data-scroll-target="#setup">1. setup</a></li>
   <li><a href="#model-architecture" id="toc-model-architecture" class="nav-link" data-scroll-target="#model-architecture">2. model architecture</a></li>
   <li><a href="#main-training-loop" id="toc-main-training-loop" class="nav-link" data-scroll-target="#main-training-loop">3. Main Training Loop</a></li>
   <li><a href="#results-visualization" id="toc-results-visualization" class="nav-link" data-scroll-target="#results-visualization">4. Results &amp; Visualization</a></li>
@@ -3098,7 +3099,7 @@ vertical-align: -.125em;
 
 <header id="title-block-header" class="quarto-title-block default">
 <div class="quarto-title">
-<h1 class="title">PyTorch Training Locally in R (Epigenetic Clock)</h1>
+<h1 class="title">Torch epiclock Training in R</h1>
 </div>
 
 
@@ -3120,6 +3121,9 @@ vertical-align: -.125em;
 <p>This script trains a Torch model for age prediction using DNA methylation data in R.</p>
 <p>It includes data loading, preprocessing, model training, evaluation, and visualization.</p>
 <p>The pipeline is structured to be reproducible and modular, allowing for easy adjustments to hyperparameters and probe sets on the VAI HPC with GPU settings.</p>
+</section>
+<section id="setup" class="level3">
+<h3 class="anchored" data-anchor-id="setup">1. setup</h3>
 <div class="cell">
 <div class="sourceCode cell-code" id="cb1"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Load Libraries</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(torch)</span>
